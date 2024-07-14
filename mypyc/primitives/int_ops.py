@@ -1,127 +1,305 @@
-"""Integer primitive ops.
+"""Arbitrary-precision integer primitive ops.
 
 These mostly operate on (usually) unboxed integers that use a tagged pointer
-representation (CPyTagged).
+representation (CPyTagged) and correspond to the Python 'int' type.
 
 See also the documentation for mypyc.rtypes.int_rprimitive.
+
+Use mypyc.ir.ops.IntOp for operations on fixed-width/C integers.
 """
 
-from mypyc.ir.ops import OpDescription, ERR_NEVER, ERR_MAGIC
+from __future__ import annotations
+
+from mypyc.ir.ops import (
+    ERR_ALWAYS,
+    ERR_MAGIC,
+    ERR_MAGIC_OVERLAPPING,
+    ERR_NEVER,
+    PrimitiveDescription,
+)
 from mypyc.ir.rtypes import (
-    int_rprimitive, bool_rprimitive, float_rprimitive, object_rprimitive, short_int_rprimitive,
-    str_rprimitive, RType
+    RType,
+    bit_rprimitive,
+    bool_rprimitive,
+    c_pyssize_t_rprimitive,
+    float_rprimitive,
+    int16_rprimitive,
+    int32_rprimitive,
+    int64_rprimitive,
+    int_rprimitive,
+    object_rprimitive,
+    str_rprimitive,
+    void_rtype,
 )
 from mypyc.primitives.registry import (
-    name_ref_op, binary_op, unary_op, func_op, custom_op,
-    simple_emit, call_emit, name_emit,
+    CFunctionDescription,
+    binary_op,
+    custom_op,
+    function_op,
+    load_address_op,
+    unary_op,
 )
 
-# These int constructors produce object_rprimitives that then need to be unboxed
-# I guess unboxing ourselves would save a check and branch though?
+# Constructors for builtins.int and native int types have the same behavior. In
+# interpreted mode, native int types are just aliases to 'int'.
+for int_name in (
+    "builtins.int",
+    "mypy_extensions.i64",
+    "mypy_extensions.i32",
+    "mypy_extensions.i16",
+    "mypy_extensions.u8",
+):
+    # These int constructors produce object_rprimitives that then need to be unboxed
+    # I guess unboxing ourselves would save a check and branch though?
 
-# Get the type object for 'builtins.int'.
-# For ordinary calls to int() we use a name_ref to the type
-name_ref_op('builtins.int',
-            result_type=object_rprimitive,
-            error_kind=ERR_NEVER,
-            emit=name_emit('&PyLong_Type', target_type='PyObject *'),
-            is_borrowed=True)
+    # Get the type object for 'builtins.int' or a native int type.
+    # For ordinary calls to int() we use a load_address to the type.
+    # Native ints don't have a separate type object -- we just use 'builtins.int'.
+    load_address_op(name=int_name, type=object_rprimitive, src="PyLong_Type")
 
-# Convert from a float to int. We could do a bit better directly.
-func_op(
-    name='builtins.int',
-    arg_types=[float_rprimitive],
-    result_type=object_rprimitive,
+    # int(float). We could do a bit better directly.
+    function_op(
+        name=int_name,
+        arg_types=[float_rprimitive],
+        return_type=int_rprimitive,
+        c_function_name="CPyTagged_FromFloat",
+        error_kind=ERR_MAGIC,
+    )
+
+    # int(string)
+    function_op(
+        name=int_name,
+        arg_types=[str_rprimitive],
+        return_type=object_rprimitive,
+        c_function_name="CPyLong_FromStr",
+        error_kind=ERR_MAGIC,
+    )
+
+    # int(string, base)
+    function_op(
+        name=int_name,
+        arg_types=[str_rprimitive, int_rprimitive],
+        return_type=object_rprimitive,
+        c_function_name="CPyLong_FromStrWithBase",
+        error_kind=ERR_MAGIC,
+    )
+
+# str(int)
+int_to_str_op = function_op(
+    name="builtins.str",
+    arg_types=[int_rprimitive],
+    return_type=str_rprimitive,
+    c_function_name="CPyTagged_Str",
     error_kind=ERR_MAGIC,
-    emit=call_emit('CPyLong_FromFloat'),
-    priority=1)
+    priority=2,
+)
 
-# int(string)
-func_op(
-    name='builtins.int',
-    arg_types=[str_rprimitive],
-    result_type=object_rprimitive,
+# We need a specialization for str on bools also since the int one is wrong...
+function_op(
+    name="builtins.str",
+    arg_types=[bool_rprimitive],
+    return_type=str_rprimitive,
+    c_function_name="CPyBool_Str",
     error_kind=ERR_MAGIC,
-    emit=call_emit('CPyLong_FromStr'),
-    priority=1)
-
-# int(string, base)
-func_op(
-    name='builtins.int',
-    arg_types=[str_rprimitive, int_rprimitive],
-    result_type=object_rprimitive,
-    error_kind=ERR_MAGIC,
-    emit=call_emit('CPyLong_FromStrWithBase'),
-    priority=1)
+    priority=3,
+)
 
 
-def int_binary_op(op: str, c_func_name: str,
-                  result_type: RType = int_rprimitive,
-                  error_kind: int = ERR_NEVER) -> None:
-    binary_op(op=op,
-              arg_types=[int_rprimitive, int_rprimitive],
-              result_type=result_type,
-              error_kind=error_kind,
-              format_str='{dest} = {args[0]} %s {args[1]} :: int' % op,
-              emit=call_emit(c_func_name))
+def int_binary_primitive(
+    op: str, primitive_name: str, return_type: RType = int_rprimitive, error_kind: int = ERR_NEVER
+) -> PrimitiveDescription:
+    return binary_op(
+        name=op,
+        arg_types=[int_rprimitive, int_rprimitive],
+        return_type=return_type,
+        primitive_name=primitive_name,
+        error_kind=error_kind,
+    )
 
 
-def int_compare_op(op: str, c_func_name: str) -> None:
-    int_binary_op(op, c_func_name, bool_rprimitive)
-    # Generate a straight compare if we know both sides are short
-    binary_op(op=op,
-              arg_types=[short_int_rprimitive, short_int_rprimitive],
-              result_type=bool_rprimitive,
-              error_kind=ERR_NEVER,
-              format_str='{dest} = {args[0]} %s {args[1]} :: short_int' % op,
-              emit=simple_emit(
-                  '{dest} = (Py_ssize_t){args[0]} %s (Py_ssize_t){args[1]};' % op),
-              priority=2)
+int_eq = int_binary_primitive(op="==", primitive_name="int_eq", return_type=bit_rprimitive)
+int_ne = int_binary_primitive(op="!=", primitive_name="int_ne", return_type=bit_rprimitive)
+int_lt = int_binary_primitive(op="<", primitive_name="int_lt", return_type=bit_rprimitive)
+int_le = int_binary_primitive(op="<=", primitive_name="int_le", return_type=bit_rprimitive)
+int_gt = int_binary_primitive(op=">", primitive_name="int_gt", return_type=bit_rprimitive)
+int_ge = int_binary_primitive(op=">=", primitive_name="int_ge", return_type=bit_rprimitive)
 
 
-# Binary, unary and augmented assignment operations that operate on CPyTagged ints.
+def int_binary_op(
+    name: str,
+    c_function_name: str,
+    return_type: RType = int_rprimitive,
+    error_kind: int = ERR_NEVER,
+) -> None:
+    binary_op(
+        name=name,
+        arg_types=[int_rprimitive, int_rprimitive],
+        return_type=return_type,
+        c_function_name=c_function_name,
+        error_kind=error_kind,
+    )
 
-int_binary_op('+', 'CPyTagged_Add')
-int_binary_op('-', 'CPyTagged_Subtract')
-int_binary_op('*', 'CPyTagged_Multiply')
+
+# Binary, unary and augmented assignment operations that operate on CPyTagged ints
+# are implemented as C functions.
+
+int_binary_op("+", "CPyTagged_Add")
+int_binary_op("-", "CPyTagged_Subtract")
+int_binary_op("*", "CPyTagged_Multiply")
+int_binary_op("&", "CPyTagged_And")
+int_binary_op("|", "CPyTagged_Or")
+int_binary_op("^", "CPyTagged_Xor")
 # Divide and remainder we honestly propagate errors from because they
 # can raise ZeroDivisionError
-int_binary_op('//', 'CPyTagged_FloorDivide', error_kind=ERR_MAGIC)
-int_binary_op('%', 'CPyTagged_Remainder', error_kind=ERR_MAGIC)
+int_binary_op("//", "CPyTagged_FloorDivide", error_kind=ERR_MAGIC)
+int_binary_op("%", "CPyTagged_Remainder", error_kind=ERR_MAGIC)
+# Negative shift counts raise an exception
+int_binary_op(">>", "CPyTagged_Rshift", error_kind=ERR_MAGIC)
+int_binary_op("<<", "CPyTagged_Lshift", error_kind=ERR_MAGIC)
+
+int_binary_op(
+    "/", "CPyTagged_TrueDivide", return_type=float_rprimitive, error_kind=ERR_MAGIC_OVERLAPPING
+)
 
 # This should work because assignment operators are parsed differently
 # and the code in irbuild that handles it does the assignment
 # regardless of whether or not the operator works in place anyway.
-int_binary_op('+=', 'CPyTagged_Add')
-int_binary_op('-=', 'CPyTagged_Subtract')
-int_binary_op('*=', 'CPyTagged_Multiply')
-int_binary_op('//=', 'CPyTagged_FloorDivide', error_kind=ERR_MAGIC)
-int_binary_op('%=', 'CPyTagged_Remainder', error_kind=ERR_MAGIC)
+int_binary_op("+=", "CPyTagged_Add")
+int_binary_op("-=", "CPyTagged_Subtract")
+int_binary_op("*=", "CPyTagged_Multiply")
+int_binary_op("&=", "CPyTagged_And")
+int_binary_op("|=", "CPyTagged_Or")
+int_binary_op("^=", "CPyTagged_Xor")
+int_binary_op("//=", "CPyTagged_FloorDivide", error_kind=ERR_MAGIC)
+int_binary_op("%=", "CPyTagged_Remainder", error_kind=ERR_MAGIC)
+int_binary_op(">>=", "CPyTagged_Rshift", error_kind=ERR_MAGIC)
+int_binary_op("<<=", "CPyTagged_Lshift", error_kind=ERR_MAGIC)
 
-int_compare_op('==', 'CPyTagged_IsEq')
-int_compare_op('!=', 'CPyTagged_IsNe')
-int_compare_op('<', 'CPyTagged_IsLt')
-int_compare_op('<=', 'CPyTagged_IsLe')
-int_compare_op('>', 'CPyTagged_IsGt')
-int_compare_op('>=', 'CPyTagged_IsGe')
 
-# Add short integers and assume that it doesn't overflow or underflow.
-# Assume that the operands are not big integers.
-unsafe_short_add = custom_op(
+def int_unary_op(name: str, c_function_name: str) -> CFunctionDescription:
+    return unary_op(
+        name=name,
+        arg_type=int_rprimitive,
+        return_type=int_rprimitive,
+        c_function_name=c_function_name,
+        error_kind=ERR_NEVER,
+    )
+
+
+int_neg_op = int_unary_op("-", "CPyTagged_Negate")
+int_invert_op = int_unary_op("~", "CPyTagged_Invert")
+
+
+# Primitives related to integer comparison operations:
+
+
+# Equals operation on two boxed tagged integers
+int_equal_ = custom_op(
     arg_types=[int_rprimitive, int_rprimitive],
-    result_type=short_int_rprimitive,
+    return_type=bit_rprimitive,
+    c_function_name="CPyTagged_IsEq_",
     error_kind=ERR_NEVER,
-    format_str='{dest} = {args[0]} + {args[1]} :: short_int',
-    emit=simple_emit('{dest} = {args[0]} + {args[1]};'))
+    is_pure=True,
+)
 
+# Less than operation on two boxed tagged integers
+int_less_than_ = custom_op(
+    arg_types=[int_rprimitive, int_rprimitive],
+    return_type=bit_rprimitive,
+    c_function_name="CPyTagged_IsLt_",
+    error_kind=ERR_NEVER,
+    is_pure=True,
+)
 
-def int_unary_op(op: str, c_func_name: str) -> OpDescription:
-    return unary_op(op=op,
-                    arg_type=int_rprimitive,
-                    result_type=int_rprimitive,
-                    error_kind=ERR_NEVER,
-                    format_str='{dest} = %s{args[0]} :: int' % op,
-                    emit=call_emit(c_func_name))
+int64_divide_op = custom_op(
+    arg_types=[int64_rprimitive, int64_rprimitive],
+    return_type=int64_rprimitive,
+    c_function_name="CPyInt64_Divide",
+    error_kind=ERR_MAGIC_OVERLAPPING,
+)
 
+int64_mod_op = custom_op(
+    arg_types=[int64_rprimitive, int64_rprimitive],
+    return_type=int64_rprimitive,
+    c_function_name="CPyInt64_Remainder",
+    error_kind=ERR_MAGIC_OVERLAPPING,
+)
 
-int_neg_op = int_unary_op('-', 'CPyTagged_Negate')
+int32_divide_op = custom_op(
+    arg_types=[int32_rprimitive, int32_rprimitive],
+    return_type=int32_rprimitive,
+    c_function_name="CPyInt32_Divide",
+    error_kind=ERR_MAGIC_OVERLAPPING,
+)
+
+int32_mod_op = custom_op(
+    arg_types=[int32_rprimitive, int32_rprimitive],
+    return_type=int32_rprimitive,
+    c_function_name="CPyInt32_Remainder",
+    error_kind=ERR_MAGIC_OVERLAPPING,
+)
+
+int16_divide_op = custom_op(
+    arg_types=[int16_rprimitive, int16_rprimitive],
+    return_type=int16_rprimitive,
+    c_function_name="CPyInt16_Divide",
+    error_kind=ERR_MAGIC_OVERLAPPING,
+)
+
+int16_mod_op = custom_op(
+    arg_types=[int16_rprimitive, int16_rprimitive],
+    return_type=int16_rprimitive,
+    c_function_name="CPyInt16_Remainder",
+    error_kind=ERR_MAGIC_OVERLAPPING,
+)
+
+# Convert tagged int (as PyObject *) to i64
+int_to_int64_op = custom_op(
+    arg_types=[object_rprimitive],
+    return_type=int64_rprimitive,
+    c_function_name="CPyLong_AsInt64",
+    error_kind=ERR_MAGIC_OVERLAPPING,
+)
+
+ssize_t_to_int_op = custom_op(
+    arg_types=[c_pyssize_t_rprimitive],
+    return_type=int_rprimitive,
+    c_function_name="CPyTagged_FromSsize_t",
+    error_kind=ERR_MAGIC,
+)
+
+int64_to_int_op = custom_op(
+    arg_types=[int64_rprimitive],
+    return_type=int_rprimitive,
+    c_function_name="CPyTagged_FromInt64",
+    error_kind=ERR_MAGIC,
+)
+
+# Convert tagged int (as PyObject *) to i32
+int_to_int32_op = custom_op(
+    arg_types=[object_rprimitive],
+    return_type=int32_rprimitive,
+    c_function_name="CPyLong_AsInt32",
+    error_kind=ERR_MAGIC_OVERLAPPING,
+)
+
+int32_overflow = custom_op(
+    arg_types=[],
+    return_type=void_rtype,
+    c_function_name="CPyInt32_Overflow",
+    error_kind=ERR_ALWAYS,
+)
+
+int16_overflow = custom_op(
+    arg_types=[],
+    return_type=void_rtype,
+    c_function_name="CPyInt16_Overflow",
+    error_kind=ERR_ALWAYS,
+)
+
+uint8_overflow = custom_op(
+    arg_types=[],
+    return_type=void_rtype,
+    c_function_name="CPyUInt8_Overflow",
+    error_kind=ERR_ALWAYS,
+)

@@ -13,6 +13,11 @@ Construct dict from keys and values:
 
 * ``{key: value,  ...}``
 
+Construct empty dict:
+
+* ``{}``
+* ``dict()``
+
 Construct dict from another object:
 
 * ``dict(d: dict)``
@@ -33,12 +38,18 @@ Statements
 ----------
 
 * ``d[key] = value``
+* ``for key in d:``
 
 Methods
 -------
 
 * ``d.get(key)``
 * ``d.get(key, default)``
+* ``d.keys()``
+* ``d.values()``
+* ``d.items()``
+* ``d.copy()``
+* ``d.clear()``
 * ``d1.update(d2: dict)``
 * ``d.update(x: Iterable)``
 

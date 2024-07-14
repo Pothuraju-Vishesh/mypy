@@ -73,11 +73,11 @@ compiled code. For example, you may want to do interactive testing or
 to run benchmarks. This is also handy if you want to inspect the
 generated C code (see Inspecting Generated C).
 
-Run `scripts/mypyc` to compile a module to a C extension using your
+Run `mypyc` to compile a module to a C extension using your
 development version of mypyc:
 
 ```
-$ scripts/mypyc program.py
+$ mypyc program.py
 ```
 
 This will generate a C extension for `program` in the current working
@@ -149,7 +149,7 @@ know for mypyc contributors:
   ([The C Programming Language](https://en.wikipedia.org/wiki/The_C_Programming_Language)
   is a classic book about C)
 * Basic familiarity with the Python C API (see
-  [Python C API documentation](https://docs.python.org/3/c-api/intro.html))
+  [Python C API documentation](https://docs.python.org/3/c-api/intro.html)). [Extending and Embedding the Python Interpreter](https://docs.python.org/3/extending/index.html) is a good tutorial for beginners.
 * Basics of compilers (see the
   [mypy wiki](https://github.com/python/mypy/wiki/Learning-Resources)
   for some ideas)
@@ -193,20 +193,22 @@ information. See the test cases in
 `mypyc/test-data/irbuild-basic.test` for examples of what the IR looks
 like in a pretty-printed form.
 
-## Tests
+## Testing overview
 
-Mypyc test cases are defined in the same format (`.test`) as used for
-test cases for mypy. Look at mypy developer documentation for a general
-overview of how things work.  Test cases live under `mypyc/test-data/`,
-and you can run all mypyc tests via `pytest mypyc`. If you don't make
-changes to code under `mypy/`, it's not important to regularly run mypy
-tests during development.
+Most mypyc test cases are defined in the same format (`.test`) as used
+for test cases for mypy. Look at mypy developer documentation for a
+general overview of how things work. Test cases live under
+`mypyc/test-data/`, and you can run all mypyc tests via `pytest
+-q mypyc`. If you don't make changes to code under `mypy/`, it's not
+important to regularly run mypy tests during development.
 
 When you create a PR, we have Continuous Integration jobs set up that
 compile mypy using mypyc and run the mypy test suite using the
 compiled mypy. This will sometimes catch additional issues not caught
 by the mypyc test suite. It's okay to not do this in your local
 development environment.
+
+We discuss writing tests in more detail later in this document.
 
 ## Inspecting Generated IR
 
@@ -229,11 +231,25 @@ Installing a released version of mypy using `pip` (which is compiled)
 and using `dmypy` (mypy daemon) is a much, much faster way to type
 check mypyc during development.
 
-## Overview of Generated C
+## Value Representation
 
-Mypyc uses a tagged pointer representation for integers, `char` for
-booleans, and C structs for tuples. For most other objects mypyc uses
-the CPython `PyObject *`.
+Mypyc uses a tagged pointer representation for values of type `int`
+(`CPyTagged`), `char` for booleans, and C structs for tuples. For most
+other objects mypyc uses the CPython `PyObject *`.
+
+Python integers that fit in 31/63 bits (depending on whether we are on
+a 32-bit or 64-bit platform) are represented as C integers
+(`CPyTagged`) shifted left by 1. Integers that don't fit in this
+representation are represented as pointers to a `PyObject *` (this is
+always a Python `int` object) with the least significant bit
+set. Tagged integer operations are defined in `mypyc/lib-rt/int_ops.c`
+and `mypyc/lib-rt/CPy.h`.
+
+There are also low-level integer types, such as `int32` (see
+`mypyc.ir.rtypes`), that don't use the tagged representation. These
+types are not exposed to users, but they are used in generated code.
+
+## Overview of Generated C
 
 Mypyc compiles a function into two functions, a native function and
 a wrapper function:
@@ -259,10 +275,8 @@ insert a runtime type check (an unbox or a cast operation), since
 Python lists can contain arbitrary objects.
 
 The generated code uses various helpers defined in
-`mypyc/lib-rt/CPy.h`.  The header must only contain static functions,
-since it is included in many files. `mypyc/lib-rt/CPy.c` contains
-definitions that must only occur once, but really most of `CPy.h`
-should be moved into it.
+`mypyc/lib-rt/CPy.h`. The implementations are in various `.c` files
+under `mypyc/lib-rt`.
 
 ## Inspecting Generated C
 
@@ -290,10 +304,63 @@ what to do to implement specific kinds of mypyc features.
 Our bread-and-butter testing strategy is compiling code with mypyc and
 running it. There are downsides to this (kind of slow, tests a huge
 number of components at once, insensitive to the particular details of
-the IR), but there really is no substitute for running code.
+the IR), but there really is no substitute for running code. You can
+also write tests that test the generated IR, however.
+
+### Tests that compile and run code
 
 Test cases that compile and run code are located in
-`test-data/run*.test` and the test driver is in `mypyc.test.test_run`.
+`mypyc/test-data/run*.test` and the test runner is in
+`mypyc.test.test_run`.  The code to compile comes after `[case
+test<name>]`. The code gets saved into the file `native.py`, and it
+gets compiled into the module `native`.
+
+Each test case uses a non-compiled Python driver that imports the
+`native` module and typically calls some compiled functions. Some
+tests also perform assertions and print messages in the driver.
+
+If you don't provide a driver, a default driver is used. The default
+driver just calls each module-level function that is prefixed with
+`test_` and reports any uncaught exceptions as failures. (Failure to
+build or a segfault also count as failures.) `testStringOps` in
+`mypyc/test-data/run-strings.test` is an example of a test that uses
+the default driver.
+
+You should usually use the default driver (don't include
+`driver.py`). It's the simplest way to write most tests.
+
+Here's an example test case that uses the default driver:
+
+```
+[case testConcatenateLists]
+def test_concat_lists() -> None:
+    assert [1, 2] + [5, 6] == [1, 2, 5, 6]
+
+def test_concat_empty_lists() -> None:
+    assert [] + [] == []
+```
+
+There is one test case, `testConcatenateLists`. It has two sub-cases,
+`test_concat_lists` and `test_concat_empty_lists`. Note that you can
+use the pytest -k argument to only run `testConcetanateLists`, but you
+can't filter tests at the sub-case level.
+
+It's recommended to have multiple sub-cases per test case, since each
+test case has significant fixed overhead. Each test case is run in a
+fresh Python subprocess.
+
+Many of the existing test cases provide a custom driver by having
+`[file driver.py]`, followed by the driver implementation. Here the
+driver is not compiled, which is useful if you want to test
+interactions between compiled and non-compiled code. However, many of
+the tests don't have a good reason to use a custom driver -- when they
+were written, the default driver wasn't available.
+
+Test cases can also have a `[out]` section, which specifies the
+expected contents of stdout the test case should produce. New test
+cases should prefer assert statements to `[out]` sections.
+
+### IR tests
 
 If the specifics of the generated IR of a change is important
 (because, for example, you want to make sure a particular optimization
@@ -359,23 +426,22 @@ If you add an operation that compiles into a lot of C code, you may
 also want to add a C helper function for the operation to make the
 generated code smaller. Here is how to do this:
 
-* Add the operation to `mypyc/lib-rt/CPy.h`. Usually defining a static
-  function is the right thing to do, but feel free to also define
-  inline functions for very simple and performance-critical
-  operations. We avoid macros since they are error-prone.
+* Declare the operation in `mypyc/lib-rt/CPy.h`. We avoid macros, and
+  we generally avoid inline functions to make it easier to target
+  additional backends in the future.
 
 * Consider adding a unit test for your C helper in `mypyc/lib-rt/test_capi.cc`.
   We use
   [Google Test](https://github.com/google/googletest) for writing
   tests in C++. The framework is included in the repository under the
   directory `googletest/`. The C unit tests are run as part of the
-  pytest test suite (`test_c_unit_tests`).
+  pytest test suite (`test_c_unit_test`).
 
 ### Adding a Specialized Primitive Operation
 
 Mypyc speeds up operations on primitive types such as `list` and `int`
 by having primitive operations specialized for specific types. These
-operations are defined in `mypyc.primitives` (and
+operations are declared in `mypyc.primitives` (and
 `mypyc/lib-rt/CPy.h`).  For example, `mypyc.primitives.list_ops`
 contains primitives that target list objects.
 
@@ -434,7 +500,7 @@ operations, and so on. You likely also want to add some faster,
 specialized primitive operations for the type (see Adding a
 Specialized Primitive Operation above for how to do this).
 
-Add a test case to `mypyc/test-data/run.test` to test compilation and
+Add a test case to `mypyc/test-data/run*.test` to test compilation and
 running compiled code. Ideas for things to test:
 
 * Test using the type as an argument.
@@ -470,7 +536,9 @@ about how to do this.
 
 * Feel free to open GitHub issues with questions if you need help when
   contributing, or ask questions in existing issues. Note that we only
-  support contributors. Mypyc is not (yet) an end-user product.
+  support contributors. Mypyc is not (yet) an end-user product. You
+  can also ask questions in our Gitter chat
+  (https://gitter.im/mypyc-dev/community).
 
 ## Undocumented Workflows
 
